@@ -1,0 +1,381 @@
+{
+  "name": "FE test",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "1f5a9c05-cc1e-4d19-b6f5-f42b22e10efe",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -896,
+        0
+      ],
+      "id": "eee3bd79-d215-401b-a077-0189dbf1bd56",
+      "name": "Webhook",
+      "webhookId": "1f5a9c05-cc1e-4d19-b6f5-f42b22e10efe"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1584,
+        0
+      ],
+      "id": "e4acd4ab-ce4f-4c26-8838-2971a1f6b0ec",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_HUGGINGFACE_TOKEN_HERE"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "image/png"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"inputs\": {{ JSON.stringify($json.inputs) }}\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1136,
+        0
+      ],
+      "id": "8fa8db1b-c18f-4fc0-888b-39d99a4c4276",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Input: Google Slides API JSON (from Presentation: Get or Pages: Get)\n * Output: one item per slide with { slideId, title, caption, refImageUrl, slideNumber }\n * Works entirely on JSON (no fs/path/modules).\n */\n\n// Helper: extract plain text from a shape's text elements\nfunction extractText(textElements = []) {\n  return textElements\n    .map(t => (t.textRun && t.textRun.content ? t.textRun.content : \"\"))\n    .join(\"\")\n    .replace(/\\s+\\n/g, \"\\n\")\n    .trim();\n}\n\nconst output = [];\n\n// The upstream node might return either a single object with .slides,\n// or an array of pages; handle both.\nlet slides = [];\nif (Array.isArray(items) && items.length > 0) {\n  const root = items[0].json;\n  if (Array.isArray(root.slides)) {\n    slides = root.slides; // Presentation: Get result\n  } else if (Array.isArray(root.pages)) {\n    slides = root.pages;  // Pages: Get result\n  } else {\n    // Sometimes Pages: Get returns each page as an item already\n    slides = items.map(i => i.json);\n  }\n}\n\n// Iterate with index so we can add slideNumber (1-based)\nfor (let idx = 0; idx < slides.length; idx++) {\n  const s = slides[idx];\n\n  const slideId =\n    s.objectId ||\n    s.slideProperties?.notesPage?.notesProperties?.speakerNotesObjectId ||\n    \"\";\n\n  const elements = s.pageElements || [];\n\n  let title = \"\";\n  let caption = \"\";\n  let refImageUrl = \"\";\n\n  for (const el of elements) {\n    // Text\n    if (el.shape?.text?.textElements) {\n      const txt = extractText(el.shape.text.textElements);\n      if (txt) {\n        if (!title) {\n          // First non-empty line as title\n          title = (txt.split(\"\\n\").find(Boolean) || \"\").trim();\n        }\n        // Longest block as caption candidate\n        if (txt.length > caption.length) caption = txt.trim();\n      }\n    }\n    // Reference image (first image found)\n    if (!refImageUrl && el.image?.contentUrl) {\n      refImageUrl = el.image.contentUrl;\n    }\n  }\n\n  output.push({\n    json: {\n      slideId,\n      title,\n      caption,\n      refImageUrl,\n      slideNumber: idx + 1,   // 👈 added slide number (1, 2, 3, …)\n    },\n  });\n}\n\nreturn output;\n"
+      },
+      "name": "Parse PPT Slides",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        208,
+        0
+      ],
+      "id": "005d6017-293c-408d-921c-367e21777a15"
+    },
+    {
+      "parameters": {
+        "batchSize": 100,
+        "options": {}
+      },
+      "name": "Split Slides",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [
+        496,
+        0
+      ],
+      "id": "bc210735-b2ab-4dae-a157-b9454b2559d9"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: current slide in $json\nconst slide = $json;\n\nconst title      = (slide.title || '').trim();\nconst caption    = (slide.caption || 'no caption provided').trim();\nconst notes      = (slide.notes || '').trim();\nconst reference  = slide.imageUrl || slide.refImageUrl || '';\nconst aspect     = (slide.aspectRatio || '16:9').toString().trim();\n\n// Map aspect → model-friendly size (tweak if you like)\nfunction pickSize(a) {\n  const k = a.replace(/\\s/g, '');\n  if (k === '1:1') return { width: 768, height: 768 };\n  if (k === '4:3') return { width: 896, height: 672 };\n  // default 16:9\n  return { width: 1024, height: 576 };\n}\nconst { width, height } = pickSize(aspect);\n\n// Base prompt for this slide\nconst basePrompt =\n`Create a realistic, presentation-quality background image inspired by the slide titled \"${title}\".\nThe idea of this slide is: ${caption}.\n${notes ? 'Additional notes: ' + notes + '.' : ''}\nUse balanced composition, harmonious colors, and lighting suited for a ${aspect} aspect ratio slide.\nKeep it minimal and professional, matching the tone of a corporate presentation.\nDo NOT include any text, words, or logos in the image.\n${reference ? 'Use the visual mood or color scheme of this reference image: ' + reference + '.' : ''}\nEnsure clarity, clean design, and consistent style with other slides.`;\n\n// Small pool of “spices” to nudge variation between images\nconst spices = [\n  'soft rim lighting', 'cinematic angle', 'diffused daylight',\n  'backlit glow', 'volumetric light', 'low depth of field',\n  'warm–cool color contrast', 'subtle lens flare'\n];\nconst VARIANTS = 5;\n\n// Simple helpers\nconst randi = n => Math.floor(Math.random() * n);\nconst uniqSeed = (i) =>\n  Number(\n    String(Date.now()) +\n    String(Math.floor(Math.random() * 1e6)) +\n    String(i) +\n    String(slide.slideId || '')\n      .split('')\n      .reduce((a,c)=>a+c.charCodeAt(0),0)\n  );\n\n// 🔢 Use the parsed slideNumber from your Parse node; coerce to a clean integer (fallback 1)\nconst slideNumRaw = slide.slideNumber ?? slide.index ?? 1;\nconst slideNum = Number.parseInt(String(slideNumRaw), 10) || 1;\n\n// Emit 5 variant items — all share the SAME imageName per slide\nconst out = [];\nfor (let i = 0; i < VARIANTS; i++) {\n  const spice = spices[randi(spices.length)];\n  const seed  = uniqSeed(i);\n\n  out.push({\n    json: {\n      // The model will read these:\n      inputs: `${basePrompt}\\nCreative variation: ${spice}.`,\n      parameters: {\n        seed,\n        width, height,\n        num_inference_steps: 28,\n        guidance: 3.5\n      },\n\n      // Useful extras for downstream nodes (naming, grouping, etc.)\n      title,\n      variantIndex: i + 1,\n\n      // 👇 All five variants from the same slide get the same name\n      imageName: `${slideNum}.png`\n    }\n  });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        0
+      ],
+      "id": "c680eba6-ed47-4c85-b3c9-3f72c34e2ea7",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        704,
+        -240
+      ],
+      "id": "c1d97689-a8d1-4d66-b9b9-80535967dc88",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "presentationId": "={{ $json.presentationId }}"
+      },
+      "type": "n8n-nodes-base.googleSlides",
+      "typeVersion": 2,
+      "position": [
+        -128,
+        0
+      ],
+      "id": "98e3229f-a14b-47f4-9a51-b8329f47b221",
+      "name": "Get a presentation",
+      "credentials": {
+        "googleSlidesOAuth2Api": {
+          "id": "1gvyI8V5EstxAcHu",
+          "name": "Google Slides account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prefer presentationId if frontend already parsed it\nlet id = $json.body?.presentationId;\n\nif (!id && $json.body?.presentationUrl) {\n  const url = $json.body.presentationUrl;\n  const m1 = url.match(/\\/presentation\\/(?:u\\/\\d+\\/)?d\\/([a-zA-Z0-9_-]+)/);\n  const m2 = url.match(/[?&](?:id|presentationId)=([a-zA-Z0-9_-]+)/);\n  id = (m1 && m1[1]) || (m2 && m2[1]) || null;\n}\n\nif (!id) {\n  throw new Error(\"Could not extract Google Slides presentationId from the URL.\");\n}\n\nreturn [{ json: { presentationId: id } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        0
+      ],
+      "id": "367477c9-a27e-4dd4-a148-8d125179e736",
+      "name": "extract Id"
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "https://docs.google.com/presentation/d/1spny-u_5Qukbv-V4N9Liau_P4tnx5UDymcsr8nW6Ins/edit?slide=id.p3#slide=id.p3",
+          "mode": "url"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -688,
+        0
+      ],
+      "id": "72720411-3733-4712-8483-8a7f449b9e82",
+      "name": "Download file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "nU5syBMq19h2rX8S",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "name": "={{$json.imageName}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "1ChwRAVNmT4G-e0LkkHP6CmUhMsJlO3-e",
+          "mode": "list",
+          "cachedResultName": "image generated",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1ChwRAVNmT4G-e0LkkHP6CmUhMsJlO3-e"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1376,
+        0
+      ],
+      "id": "7984fe55-3cab-485a-9867-0cb750b2638c",
+      "name": "Upload file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "nU5syBMq19h2rX8S",
+          "name": "Google Drive account"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Webhook": [
+      {
+        "json": {
+          "headers": {
+            "host": "reinventdigital12.app.n8n.cloud",
+            "user-agent": "python-requests/2.32.5",
+            "content-length": "135",
+            "accept": "*/*",
+            "accept-encoding": "gzip, br",
+            "cdn-loop": "cloudflare; loops=1; subreqs=1",
+            "cf-connecting-ip": "2405:201:5c08:a05c:6cd2:fc4:2cf6:b14d",
+            "cf-ew-via": "15",
+            "cf-ipcountry": "IN",
+            "cf-ray": "999a139b955ecb36-SIN",
+            "cf-visitor": "{\"scheme\":\"https\"}",
+            "cf-worker": "n8n.cloud",
+            "content-type": "application/json",
+            "x-forwarded-for": "2405:201:5c08:a05c:6cd2:fc4:2cf6:b14d, 172.69.165.69",
+            "x-forwarded-host": "reinventdigital12.app.n8n.cloud",
+            "x-forwarded-port": "443",
+            "x-forwarded-proto": "https",
+            "x-forwarded-server": "traefik-prod-users-gwc-32-7487c6b997-bgncn",
+            "x-is-trusted": "yes",
+            "x-real-ip": "2405:201:5c08:a05c:6cd2:fc4:2cf6:b14d"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "presentationUrl": "https://docs.google.com/presentation/d/1spny-u_5Qukbv-V4N9Liau_P4tnx5UDymcsr8nW6Ins/edit?slide=id.p3#slide=id.p3"
+          },
+          "webhookUrl": "https://reinventdigital12.app.n8n.cloud/webhook/1f5a9c05-cc1e-4d19-b6f5-f42b22e10efe",
+          "executionMode": "production"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Download file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse PPT Slides": {
+      "main": [
+        [
+          {
+            "node": "Split Slides",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Slides": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a presentation": {
+      "main": [
+        [
+          {
+            "node": "Parse PPT Slides",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "extract Id": {
+      "main": [
+        [
+          {
+            "node": "Get a presentation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download file": {
+      "main": [
+        [
+          {
+            "node": "extract Id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload file": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "876728c9-ec9f-4942-9509-d0a815cdfebb",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "da520f2c0375359dc0ec2521f2f181b95cc07c5be5131719c65c5917d5d8f91a"
+  },
+  "id": "aRByZC9TNbK5TCmO",
+  "tags": []
+}
